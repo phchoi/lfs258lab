@@ -1,0 +1,6 @@
+apiVersion: kubeadm.k8s.io/v1beta2
+kind: ClusterConfiguration
+kubernetesVersion: 1.18.1
+controlPlaneEndpoint: "{{ master_instances[0].name }}:6443"
+networking:
+  podSubnet: "{{ calico_ipv4pool_cidr }}"

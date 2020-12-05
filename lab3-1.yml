@@ -1,0 +1,154 @@
+- hosts: master
+  gather_facts: yes
+  become: true
+  become_method: sudo
+  become_user: root
+  tasks:
+    # kubeadm init expect no swap
+    - name: turn off swap
+      shell: swapoff -a
+
+    - name: comment out swap config from /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^/swapfile'
+        replace: '#/swapfile'
+
+    - name: apt-get update
+      apt: update_cache=yes force_apt_get=yes
+
+    - name: apt-get upgrade
+      apt: upgrade=dist force_apt_get=yes
+
+    - name: install docker.io
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - vim
+        - docker.io
+        - gnupg
+        - gnupg2
+        - bash-completion
+
+    - name: Add kubernetes repo
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb http://apt.kubernetes.io/ kubernetes-xenial main
+          deb http://apt.kubernetes.io/ kubernetes-yakkety main
+
+    - name: curl apt-key.gpg
+      get_url:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        dest: /tmp/apt-key.gpg
+
+    # may need some refinement to not use shell in future
+    - name: apt-key add
+      shell: apt-key add /tmp/apt-key.gpg
+
+    - name: apt-get update
+      apt: update_cache=yes force_apt_get=yes
+
+    - name: install kubeadm
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - kubeadm=1.18.1-00
+        - kubelet=1.18.1-00
+        - kubectl=1.18.1-00
+
+    - name: apt-mark hold kubeadm kubelet kubectl
+      shell: apt-mark hold kubeadm kubelet kubectl
+
+    - name: curl calico.yaml
+      get_url:
+        url: https://docs.projectcalico.org/manifests/calico.yaml
+        dest: /tmp/calico.yaml
+
+      # need to locate below line from calico.yaml and insert
+      # - name: CALICO_IPV4POOL_CIDR
+      #   value: "192.168.0.0/16"
+    - name: insert CALICO_IPV4POOL_CIDR to calico.yaml
+      blockinfile:
+        dest: /tmp/calico.yaml
+        insertbefore: '# - name: CALICO_IPV4POOL_CIDR'
+        block: |4
+                        - name: CALICO_IPV4POOL_CIDR
+                          value: "{{ calico_ipv4pool_cidr }}"
+
+
+    # propagate /etc/host
+    - name: add /etc/hosts alias
+      lineinfile:
+        dest: /etc/hosts
+        regexp: '.*{{ item.name }}.*$'
+        line: "{{ item.ip }} {{ item.name }}"
+        state: present
+      with_items:
+        - "{{ master_instances }}"
+        - "{{ worker_instances }}"
+
+
+    - name: copy kubeadm-config.yaml
+      template:
+        src: kubeadm-config.yaml.j2
+        dest: /root/kubeadm-config.yaml
+
+    - name: check if kubeadm init was run before
+      stat:
+        path: /root/kubeadm_init.out
+      register: kubeadm_init_out_file
+
+    # execute kubeadm-init
+    - block:
+      - name: execute kubeadm-init
+        shell: kubeadm init --config=/root/kubeadm-config.yaml --upload-certs
+        register: kubeadm_init_out
+  
+      - name: save kubeadm_init_out to file
+        copy:
+          content: "{{ kubeadm_init_out.stdout }}"
+          dest: /root/kubeadm_init.out
+      when: not kubeadm_init_out_file.stat.exists
+
+    - name: create ~/.kube directory non-admin user
+      file:
+        path: "/home/{{ kubectl_user }}/.kube"
+        state: directory
+        owner: "{{ kubectl_user }}"
+        group: "{{ kubectl_group }}"
+
+    - name: copy /etc/kubernetes/admin.conf non-admin user
+      copy:
+        src: "/etc/kubernetes/admin.conf"
+        dest: "/home/{{ kubectl_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ kubectl_user }}"
+        group: "{{ kubectl_group }}"
+
+    - name: install kubectl bash-completion 
+      shell: kubectl completion bash
+      register: kubectl_auto_completion
+
+    - name: save kubeadm_init_out to file
+      copy:
+        content: "{{ kubectl_auto_completion.stdout }}"
+        dest: "/etc/bash_completion.d/kubectl"
+
+- hosts: master
+  gather_facts: yes
+  become: true
+  tasks:
+    - name: kubectl apply -f calico.yaml
+      shell: "kubectl --kubeconfig /home/{{ kubectl_user }}/.kube/config apply -f /tmp/calico.yaml"
+
+    - name: kubeadm config print init-defaults
+      shell: kubeadm config print init-defaults
+      register: kubeadm_config
+
+    - name: save kubeadm config print
+      copy:
+        content: "{{ kubeadm_config.stdout }}"
+        dest: "/home/{{ kubectl_user }}/kubeadm_config_print"
